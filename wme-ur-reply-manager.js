@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name            WME UR Reply Manager
 // @name:vi         Trình quản lý phản hồi WME UR
-// @version         1.0.0-beta
+// @version         1.0.1-beta
 // @description     Manage and quickly insert UR reply templates in WME
 // @description:vi  Quản lý và chèn nhanh các mẫu trả lời UR trong WME
 // @author          vdt2210
@@ -9,12 +9,14 @@
 // @license         MIT
 // @include         /^https:\/\/(www|beta)\.waze\.com\/(?!user\/)(.{2,6}\/)?editor\/?.*$/
 // @grant           none
-// @downloadURL https://update.greasyfork.org/scripts/579002/WME%20UR%20Reply%20Manager.user.js
-// @updateURL https://update.greasyfork.org/scripts/579002/WME%20UR%20Reply%20Manager.meta.js
+// @downloadURL     https://update.greasyfork.org/scripts/579002/WME%20UR%20Reply%20Manager.user.js
+// @updateURL       https://update.greasyfork.org/scripts/579002/WME%20UR%20Reply%20Manager.meta.js
 // ==/UserScript==
 
 (function () {
   'use strict';
+
+  const LOG_PREFIX = '[UR-ReplyManager]';
 
   // --- I18N Logic ---
   const translations = {
@@ -41,6 +43,7 @@
       addSuccess: 'Template added successfully!',
       updateSuccess: 'Template updated successfully!',
       cancelEdit: 'Discard changes?',
+      defaultReporterText: 'reporter',
     },
     vi: {
       modalTitle: 'Chọn mẫu trả lời',
@@ -65,6 +68,7 @@
       addSuccess: 'Mẫu đã được thêm thành công!',
       updateSuccess: 'Mẫu đã được cập nhật thành công!',
       cancelEdit: 'Hủy thay đổi?',
+      defaultReporterText: 'người báo cáo',
     },
   };
 
@@ -76,7 +80,7 @@
         locale = I18n.currentLocale().split('-')[0];
       }
     } catch (e) {
-      console.warn('Locale detection failed, using en');
+      console.warn(`${LOG_PREFIX} Locale detection failed, using en`);
     }
 
     return translations.hasOwnProperty(locale) ? locale : 'en';
@@ -86,16 +90,24 @@
   const t = (key) => translations[lang][key] || key;
 
   // --- Logic ---
-  const STORAGE_KEY = 'wme_ur_reply_manager';
+  const STORAGE_KEY = 'wme_ur_reply_templates';
   let editingTemplateId = null;
-  const getTemplates = () =>
-    JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]').sort((a, b) => {
+
+  let cachedURData = { reporter: '', coords: '', streetName: '', cityName: '' };
+
+  const getTemplates = () => {
+    const data = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]').sort((a, b) => {
       if (a.isFavorite === b.isFavorite) {
         return b.createdDate - a.createdDate;
       }
       return a.isFavorite ? -1 : 1;
     });
-  const saveTemplates = (arr) => localStorage.setItem(STORAGE_KEY, JSON.stringify(arr));
+    return data;
+  };
+
+  const saveTemplates = (arr) => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(arr));
+  };
 
   function setWzTextareaAttributes(el, id, name, placeholder = '', showLength = true) {
     el.setAttribute('id', id);
@@ -110,6 +122,212 @@
       targetEl.value = value;
       targetEl.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
     }
+  }
+
+  async function getSegmentDetailByLatLon(lat, lon) {
+    if (typeof W === 'undefined' || !W.model || !W.model.segments) {
+      return null;
+    }
+
+    function getDistance(x, y, x1, y1, x2, y2) {
+      const A = x - x1,
+        B = y - y1,
+        C = x2 - x1,
+        D = y2 - y1;
+      const dot = A * C + B * D,
+        lenSq = C * C + D * D;
+      let param = lenSq !== 0 ? dot / lenSq : -1;
+      let xx, yy;
+      if (param < 0) {
+        xx = x1;
+        yy = y1;
+      } else if (param > 1) {
+        xx = x2;
+        yy = y2;
+      } else {
+        xx = x1 + param * C;
+        yy = y1 + param * D;
+      }
+      return Math.sqrt((x - xx) ** 2 + (y - yy) ** 2);
+    }
+
+    const MAX_DIST_METERS = 10;
+    const NUMBER_OF_RETRIES = 6;
+    const RETRY_DELAY_MS = 500;
+
+    for (let attempt = 0; attempt < NUMBER_OF_RETRIES; attempt++) {
+      try {
+        const segments = W.model.segments.getObjectArray();
+
+        if (!segments || segments.length === 0) {
+          console.info(
+            `${LOG_PREFIX} Cache empty, attempt ${attempt + 1}/${NUMBER_OF_RETRIES}. Waiting ${RETRY_DELAY_MS}ms...`,
+          );
+          await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+          continue;
+        }
+
+        const lonlat = new OpenLayers.LonLat(lon, lat).transform(
+          new OpenLayers.Projection('EPSG:4326'),
+          W.map.getProjectionObject(),
+        );
+        const pX = lonlat.lon;
+        const pY = lonlat.lat;
+        const candidates = [];
+
+        segments.forEach((seg) => {
+          const segAttrs = seg?.attributes || {};
+          const components = segAttrs.geometry?.components;
+          if (!components || components.length < 2) return;
+
+          let segmentMinDist = Infinity;
+          for (let i = 0; i < components.length - 1; i++) {
+            const dist = getDistance(
+              pX,
+              pY,
+              components[i].x,
+              components[i].y,
+              components[i + 1].x,
+              components[i + 1].y,
+            );
+            if (dist < segmentMinDist) {
+              segmentMinDist = dist;
+            }
+          }
+
+          if (segmentMinDist <= MAX_DIST_METERS) {
+            candidates.push({
+              segment: seg,
+              distance: segmentMinDist,
+            });
+          }
+        });
+
+        if (candidates.length > 0) {
+          candidates.sort((a, b) => a.distance - b.distance);
+
+          const matchedSegment = candidates[0].segment;
+          const streetId = matchedSegment.attributes?.primaryStreetID;
+
+          if (streetId) {
+            const streetModel = W.model.streets?.get?.(streetId);
+            const streetAttrs = streetModel?.attributes || {};
+
+            const cityId = streetAttrs.cityID;
+            const cityModel = cityId ? W.model.cities?.get?.(cityId) : null;
+            const cityAttrs = cityModel?.attributes || {};
+
+            const segmentDetails = {
+              streetName: streetAttrs.name || '',
+              cityName: cityAttrs.name || '',
+            };
+
+            console.info(
+              `${LOG_PREFIX} Segment founded at attempt ${attempt + 1}/${NUMBER_OF_RETRIES}`,
+              segmentDetails,
+            );
+
+            return segmentDetails;
+          }
+        }
+      } catch (err) {
+        console.warn(
+          `${LOG_PREFIX} Error on attempt ${attempt + 1}/${NUMBER_OF_RETRIES}:`,
+          err.message,
+        );
+      }
+
+      console.info(
+        `${LOG_PREFIX} No matching segment found near coordinates, attempt ${attempt + 1}/${NUMBER_OF_RETRIES}. Waiting ${RETRY_DELAY_MS}ms...`,
+      );
+      await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+    }
+
+    console.info(`${LOG_PREFIX} Timeout reached. No segment found within ${MAX_DIST_METERS}m.`);
+    return null;
+  }
+
+  //TODO add option for user can change by their own default text
+  async function fetchCurrentURData() {
+    let reporter = '';
+    let coords = '';
+    let streetName = '';
+    let cityName = '';
+
+    try {
+      const panelEl = document.querySelector('.problem-edit');
+      if (panelEl) {
+        const reactKey = Object.keys(panelEl).find(
+          (key) => key.startsWith('__reactFiber$') || key.startsWith('__reactInternalInstance$'),
+        );
+        const fiber = panelEl[reactKey];
+
+        const targetChild = fiber?.memoizedProps?.children?.[0];
+        const adapter = targetChild?.props?.model?.attributes?.adapter;
+        const attrs = adapter?.problem?.attributes || adapter?.attributes?.attributes;
+
+        if (attrs) {
+          if (attrs.createdBy) {
+            const userId = attrs.createdBy;
+
+            if (typeof W !== 'undefined' && W.model && W.model.users) {
+              const userModelAttrs = W.model.users.get(Number(userId))?.attributes;
+              if (userModelAttrs && userModelAttrs.userName) {
+                reporter = userModelAttrs.userName.trim();
+              }
+            }
+          }
+
+          if (attrs.cityName) {
+            cityName = String(attrs.cityName).trim();
+          }
+
+          if (attrs.geoJSONGeometry && Array.isArray(attrs.geoJSONGeometry.coordinates)) {
+            const lon = parseFloat(attrs.geoJSONGeometry.coordinates[0]);
+            const lat = parseFloat(attrs.geoJSONGeometry.coordinates[1]);
+
+            if (!isNaN(lat) && !isNaN(lon)) {
+              coords = `${lat}, ${lon}`;
+
+              const segmentDetail = await getSegmentDetailByLatLon(lat, lon);
+              if (segmentDetail) {
+                streetName = segmentDetail.streetName.trim();
+
+                if (!cityName && segmentDetail.cityName) {
+                  cityName = segmentDetail.cityName.trim();
+                }
+              }
+            }
+          }
+        }
+      }
+    } catch (err) {
+      console.warn(`${LOG_PREFIX} Error extracting data:`, err.message);
+    }
+
+    if (!reporter) {
+      reporter = t('defaultReporterText');
+    }
+
+    cachedURData = { reporter, coords, streetName, cityName };
+  }
+
+  function processTemplateContent(content) {
+    let processed = content;
+    processed = processed.replace(/{coords}/g, cachedURData.coords || '');
+    processed = processed.replace(/{reporter}/g, cachedURData.reporter);
+    processed = processed.replace(/{street}/g, cachedURData.streetName || '');
+    processed = processed.replace(/{city}/g, cachedURData.cityName || '');
+
+    processed = processed
+      .replace(/\(\s*\)/g, '')
+      .replace(/([,.;\-\/])\s*([,.;\-\/])/g, '$1')
+      .replace(/[,.;\-\/]\s*$/, '')
+      .replace(/^[,.;\-\/]\s*/, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    return processed;
   }
 
   // --- CSS ---
@@ -162,16 +380,20 @@
     const wzPreview = document.createElement('wz-textarea');
     setWzTextareaAttributes(wzPreview, 'content-preview', 'wz-textarea-preview', undefined, false);
     wzPreview.classList.add('preview-read-only');
-    wzPreview.value = templates[0].content;
+
+    wzPreview.value = processTemplateContent(templates[0].content);
     overlay.querySelector('#wz-preview-wrapper').appendChild(wzPreview);
 
     wzSelect.addEventListener('change', () => {
       const selectedId = wzSelect.value;
       const selectedTemplate = templates.find((tmpl) => tmpl.id === selectedId);
-      wzPreview.value = selectedTemplate.content;
+      wzPreview.value = processTemplateContent(selectedTemplate.content);
     });
 
-    overlay.querySelector('#btn-close').onclick = () => overlay.remove();
+    overlay.querySelector('#btn-close').onclick = () => {
+      overlay.remove();
+    };
+
     overlay.querySelector('#btn-insert').onclick = () => {
       fillTextToWaze(targetTextarea, wzPreview.value);
       overlay.remove();
@@ -188,6 +410,8 @@
 
       const wzTA = form.querySelector('wz-textarea.new-comment-text');
       if (wzTA) {
+        fetchCurrentURData();
+
         const btn = document.createElement('wz-button');
         btn.className = 'btn-quick-reply';
         btn.setAttribute('color', 'secondary');
@@ -297,7 +521,7 @@
   function initSidebar() {
     if (typeof W === 'undefined' || !W.userscripts) return;
     const { tabLabel, tabPane } = W.userscripts.registerSidebarTab('UR-Tmpl');
-    tabLabel.innerText = 'URRT';
+    tabLabel.innerText = 'URRM';
     tabPane.innerHTML = `
             <div style="padding: 10px">
               <div style="text-align: center; margin-bottom: 8px;">
@@ -478,6 +702,7 @@
             alert(t('importError'));
           }
         } catch (err) {
+          console.warn(`${LOG_PREFIX} Import parsing failed:`, err);
           alert(t('importError'));
         }
       };
@@ -492,6 +717,7 @@
       setTimeout(bootstrap, 500);
       return;
     }
+
     initSidebar();
     injectTrigger();
 
@@ -504,5 +730,6 @@
       subtree: true,
     });
   }
+
   bootstrap();
 })();
