@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name            WME UR Reply Manager
 // @name:vi         Trình quản lý phản hồi WME UR
-// @version         1.1.0-beta
+// @version         1.1.1-beta
 // @description     Manage and quickly insert UR reply templates in WME
 // @description:vi  Quản lý và chèn nhanh các mẫu trả lời UR trong WME
 // @author          vdt2210
@@ -23,7 +23,7 @@
 
   const SEGMENT_SEARCH = {
     MAX_DIST_METERS: 10,
-    NUMBER_OF_RETRIES: 6,
+    NUMBER_OF_RETRIES: 3,
     RETRY_DELAY_MS: 500,
   };
 
@@ -743,8 +743,12 @@
       btn.style.cssText = 'width: 100%; margin-bottom: 6px;';
       btn.onclick = async (e) => {
         e.preventDefault();
+        btn.setAttribute('busy', '');
+        btn.setAttribute('disabled', '');
         await fetchCurrentURData();
         openModal(wzTA);
+        btn.removeAttribute('busy');
+        btn.removeAttribute('disabled');
       };
       form.insertBefore(btn, wzTA);
     });
