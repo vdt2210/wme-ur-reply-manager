@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name            WME UR Reply Manager
 // @name:vi         Trình quản lý phản hồi WME UR
-// @version         1.1.1-beta
+// @version         1.2.0-beta
 // @description     Manage and quickly insert UR reply templates in WME
 // @description:vi  Quản lý và chèn nhanh các mẫu trả lời UR trong WME
 // @author          vdt2210
@@ -61,6 +61,8 @@
       resetBtn: 'Reset',
       saveBtn: 'Save',
       tagCity: 'City name',
+      tagLat: 'Latitude',
+      tagLon: 'Longitude',
       tagCoords: 'GPS coordinates (latitude, longitude)',
       tagReporter: 'Name of the person who reported this UR',
       tagsHeading: 'Available Tags',
@@ -102,6 +104,8 @@
       resetBtn: 'Đặt lại',
       saveBtn: 'Lưu',
       tagCity: 'Tên thành phố',
+      tagLat: 'Vĩ độ',
+      tagLon: 'Kinh độ',
       tagCoords: 'Tọa độ GPS (vĩ độ, kinh độ)',
       tagReporter: 'Tên người báo cáo UR',
       tagsHeading: 'Các thẻ sẵn có',
@@ -116,6 +120,8 @@
   // --- Constants ---
   const TagKey = Object.freeze({
     CITY: 'city',
+    LAT: 'lat',
+    LON: 'lon',
     COORDS: 'coords',
     REPORTER: 'reporter',
     STREET: 'street',
@@ -125,6 +131,8 @@
 
   const TAG_LABEL_KEYS = {
     [TagKey.CITY]: 'tagCity',
+    [TagKey.LAT]: 'tagLat',
+    [TagKey.LON]: 'tagLon',
     [TagKey.COORDS]: 'tagCoords',
     [TagKey.REPORTER]: 'tagReporter',
     [TagKey.STREET]: 'tagStreet',
@@ -138,7 +146,6 @@
 
   const defaultValueKeys = {
     city: '',
-    coords: '',
     reporter: 'defaultReporterText',
     street: 'defaultStreetText',
   };
@@ -182,7 +189,6 @@
    */
 
   // --- Storage ---
-  const OLD_STORAGE_KEY = 'wme_ur_reply_templates';
   const STORAGE_KEY = 'wme_ur_reply_manager';
   const DEFAULT_STORAGE = {
     configs: {
@@ -190,31 +196,6 @@
     },
     templates: [],
   };
-
-  // ----- LEGACY BACKUP (remove in next release) -----
-  // Migrates localStorage `wme_ur_reply_templates` (bare TemplateItem[]).
-  function migrateOldData() {
-    const oldData = localStorage.getItem(OLD_STORAGE_KEY);
-    if (!oldData) return;
-
-    try {
-      /** @type {TemplateItem[]} */
-      const parsed = JSON.parse(oldData);
-      if (!Array.isArray(parsed)) return;
-
-      /** @type {AppStorageData} */
-      const newData = {
-        ...getStorageData(),
-        templates: parsed,
-      };
-
-      setStorageData(newData);
-      localStorage.removeItem(OLD_STORAGE_KEY);
-    } catch (err) {
-      console.warn(`${LOG_PREFIX} Failed to parse old data:`, err);
-    }
-  }
-  // ----- END LEGACY BACKUP (remove in next release) -----
 
   function initializeStorage() {
     if (!localStorage.getItem(STORAGE_KEY)) {
@@ -377,6 +358,7 @@
     for (let attempt = 0; attempt < SEGMENT_SEARCH.NUMBER_OF_RETRIES; attempt++) {
       try {
         const segments = W.model.segments.getObjectArray();
+        debugLog(`${LOG_PREFIX} segment:`, segments);
 
         if (!segments || segments.length === 0) {
           debugLog(
@@ -414,6 +396,10 @@
             }
           }
 
+          debugLog(
+            `${LOG_PREFIX} Segment ID ${segAttrs.id}, distance to UR: ${segmentMinDist.toFixed(2)} map units (${(segmentMinDist * W.map.getResolution()).toFixed(2)} meters)`,
+          );
+
           if (segmentMinDist <= SEGMENT_SEARCH.MAX_DIST_METERS) {
             candidates.push({
               segment: seg,
@@ -422,19 +408,30 @@
           }
         });
 
+        debugLog(
+          `${LOG_PREFIX} Found ${candidates.length} candidate segments within ${SEGMENT_SEARCH.MAX_DIST_METERS}m:`,
+          candidates,
+        );
+
         if (candidates.length > 0) {
           candidates.sort((a, b) => a.distance - b.distance);
 
           const matchedSegment = candidates[0].segment;
           const streetId = matchedSegment.attributes?.primaryStreetID;
 
+          debugLog(
+            `${LOG_PREFIX} Closest segment ID ${matchedSegment.id}, distance: ${candidates[0].distance.toFixed(2)} map units (${(candidates[0].distance * W.map.getResolution()).toFixed(2)} meters), streetId: ${streetId}`,
+          );
+
           if (streetId) {
-            const streetModel = W.model.streets?.get?.(streetId);
+            const streetModel = W.model.streets?.objects?.[streetId];
             const streetAttrs = streetModel?.attributes || {};
+            debugLog(`${LOG_PREFIX} Street attributes for ID ${streetId}:`, streetAttrs);
 
             const cityId = streetAttrs.cityID;
-            const cityModel = cityId ? W.model.cities?.get?.(cityId) : null;
+            const cityModel = cityId ? W.model.cities?.objects?.[cityId] : null;
             const cityAttrs = cityModel?.attributes || {};
+            debugLog(`${LOG_PREFIX} City attributes for ID ${cityId}:`, cityAttrs);
 
             const segmentDetails = {
               streetName: streetAttrs.name || '',
@@ -470,6 +467,8 @@
 
   async function fetchCurrentURData() {
     let cityName = '';
+    let lat = null;
+    let lon = null;
     let coords = '';
     let reporter = '';
     let streetName = '';
@@ -481,40 +480,54 @@
           (key) => key.startsWith('__reactFiber$') || key.startsWith('__reactInternalInstance$'),
         );
         const fiber = panelEl[reactKey];
+        debugLog(`${LOG_PREFIX} React fiber found:`, fiber);
 
         const targetChild = fiber?.memoizedProps?.children?.[0];
-        const adapter = targetChild?.props?.model?.attributes?.adapter;
+        debugLog(`${LOG_PREFIX} Target child:`, targetChild);
+        const adapter = targetChild?.props?.adapter;
+        debugLog(`${LOG_PREFIX} Adapter found:`, adapter);
         const attrs = adapter?.problem?.attributes || adapter?.attributes?.attributes;
+        debugLog(`${LOG_PREFIX} Attributes found:`, attrs);
 
         if (attrs) {
           if (attrs.createdBy) {
             const userId = attrs.createdBy;
+            debugLog(`${LOG_PREFIX} Reporter user ID:`, userId);
 
             if (typeof W !== 'undefined' && W.model && W.model.users) {
-              const userModelAttrs = W.model.users.get(Number(userId))?.attributes;
+              debugLog(`${LOG_PREFIX} W.model.users:`, W.model.users);
+              const userModelAttrs = W.model.users?.objects?.[Number(userId)]?.attributes;
+              debugLog(`${LOG_PREFIX} Reporter user attributes:`, userModelAttrs);
               if (userModelAttrs && userModelAttrs.userName) {
                 reporter = userModelAttrs.userName.trim();
+                debugLog(`${LOG_PREFIX} Reporter name:`, reporter);
               }
             }
           }
 
           if (attrs.cityName) {
             cityName = String(attrs.cityName).trim();
+            debugLog(`${LOG_PREFIX} City name from attributes:`, cityName);
           }
 
           if (attrs.geoJSONGeometry && Array.isArray(attrs.geoJSONGeometry.coordinates)) {
-            const lon = parseFloat(attrs.geoJSONGeometry.coordinates[0]);
-            const lat = parseFloat(attrs.geoJSONGeometry.coordinates[1]);
+            const parseLon = parseFloat(attrs.geoJSONGeometry.coordinates[0]);
+            const parseLat = parseFloat(attrs.geoJSONGeometry.coordinates[1]);
 
-            if (!isNaN(lat) && !isNaN(lon)) {
+            if (!isNaN(parseLat) && !isNaN(parseLon)) {
+              lon = parseLon;
+              lat = parseLat;
               coords = `${lat}, ${lon}`;
+              debugLog(`${LOG_PREFIX} Coordinates from attributes:`, { lat, lon });
 
               const segmentDetail = await getSegmentDetailByLatLon(lat, lon);
               if (segmentDetail) {
                 streetName = segmentDetail.streetName.trim();
+                debugLog(`${LOG_PREFIX} Street name from segment detail:`, streetName);
 
                 if (!cityName && segmentDetail.cityName) {
                   cityName = segmentDetail.cityName.trim();
+                  debugLog(`${LOG_PREFIX} City name from segment detail:`, cityName);
                 }
               }
             }
@@ -527,6 +540,8 @@
 
     cachedURData = {
       [TagKey.CITY]: cityName,
+      [TagKey.LAT]: lat,
+      [TagKey.LON]: lon,
       [TagKey.COORDS]: coords,
       [TagKey.REPORTER]: reporter,
       [TagKey.STREET]: streetName,
@@ -910,56 +925,60 @@
       tagDisplayDiv.appendChild(document.createTextNode(' - '));
       tagDisplayDiv.appendChild(span);
 
-      const inputDiv = document.createElement('div');
-      inputDiv.style.cssText = 'display: flex; gap: 6px; align-items: center;';
-
-      const label = document.createElement('wz-label');
-      label.textContent = t('defaultValueLabel');
-
-      const input = document.createElement('wz-text-input');
-      input.setAttribute('type', 'text');
-      input.setAttribute('size', 'sm');
-      input.setAttribute('maxlength', '100');
-      input.setAttribute('display-maxlength', 'false');
-      input.setAttribute('placeholder', t('placeholderDefaultValue'));
-      input.style.cssText = 'flex: 1;';
-      input.value = displayValue;
-
-      input.className = 'default-value-input';
-      input.dataset.tag = tagKey;
-
-      const resetBtn = document.createElement('wz-button');
-      resetBtn.setAttribute('color', 'clear-icon');
-      resetBtn.setAttribute('size', 'sm');
-      resetBtn.className = 'default-value-reset-btn';
-      resetBtn.setAttribute('title', t('resetBtn'));
-      resetBtn.dataset.tag = tagKey;
-      resetBtn.style.display = 'none';
-      resetBtn.innerHTML = '<i class="w-icon w-icon-x"></i>';
-
-      const scriptDefault = scriptDefaults[tagKey] || '';
-
-      const syncRowReset = () => {
-        resetBtn.style.display = input.value !== scriptDefault ? '' : 'none';
-        onValueChange?.();
-      };
-
-      input.addEventListener('input', syncRowReset);
-
-      resetBtn.onclick = () => {
-        input.value = scriptDefault;
-        resetBtn.style.display = 'none';
-        onValueChange?.();
-      };
-
-      syncRowReset();
-
-      inputDiv.appendChild(input);
-      inputDiv.appendChild(resetBtn);
-
       itemDiv.appendChild(tagDisplayDiv);
-      itemDiv.appendChild(label);
-      itemDiv.appendChild(inputDiv);
+
+      if (![TagKey.COORDS, TagKey.LAT, TagKey.LON].includes(tagKey)) {
+        const inputDiv = document.createElement('div');
+        inputDiv.style.cssText = 'display: flex; gap: 6px; align-items: center;';
+
+        const label = document.createElement('wz-label');
+        label.textContent = t('defaultValueLabel');
+
+        const input = document.createElement('wz-text-input');
+        input.setAttribute('type', 'text');
+        input.setAttribute('size', 'sm');
+        input.setAttribute('maxlength', '100');
+        input.setAttribute('display-maxlength', 'false');
+        input.setAttribute('placeholder', t('placeholderDefaultValue'));
+        input.style.cssText = 'flex: 1;';
+        input.value = displayValue;
+
+        input.className = 'default-value-input';
+        input.dataset.tag = tagKey;
+
+        const resetBtn = document.createElement('wz-button');
+        resetBtn.setAttribute('color', 'clear-icon');
+        resetBtn.setAttribute('size', 'sm');
+        resetBtn.className = 'default-value-reset-btn';
+        resetBtn.setAttribute('title', t('resetBtn'));
+        resetBtn.dataset.tag = tagKey;
+        resetBtn.style.display = 'none';
+        resetBtn.innerHTML = '<i class="w-icon w-icon-x"></i>';
+
+        const scriptDefault = scriptDefaults[tagKey] || '';
+
+        const syncRowReset = () => {
+          resetBtn.style.display = input.value !== scriptDefault ? '' : 'none';
+          onValueChange?.();
+        };
+
+        input.addEventListener('input', syncRowReset);
+
+        resetBtn.onclick = () => {
+          input.value = scriptDefault;
+          resetBtn.style.display = 'none';
+          onValueChange?.();
+        };
+
+        syncRowReset();
+
+        inputDiv.appendChild(input);
+        inputDiv.appendChild(resetBtn);
+
+        itemDiv.appendChild(label);
+        itemDiv.appendChild(inputDiv);
+      }
+
       container.appendChild(itemDiv);
     });
   }
@@ -1139,15 +1158,6 @@
             if (importedData.configs && typeof importedData.configs === 'object') {
               newStorageData.configs = importedData.configs;
             }
-          } else {
-            // ----- LEGACY BACKUP import (remove in next release) -----
-            // Accepts export files that were a bare TemplateItem[] JSON array.
-            if (!Array.isArray(importedData)) {
-              alert(t('importError'));
-              return;
-            }
-            newStorageData.templates = importedData;
-            // ----- END LEGACY BACKUP import (remove in next release) -----
           }
 
           if (!newStorageData.templates.length) {
@@ -1272,7 +1282,6 @@
     }
 
     initializeStorage();
-    migrateOldData(); // LEGACY BACKUP — remove in next release
     initSidebar();
     injectTrigger();
 
