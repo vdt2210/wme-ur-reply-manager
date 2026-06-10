@@ -9,8 +9,6 @@
 // @license         MIT
 // @include         /^https:\/\/(www|beta)\.waze\.com\/(?!user\/)(.{2,6}\/)?editor\/?.*$/
 // @grant           none
-// @downloadURL     https://update.greasyfork.org/scripts/579002/WME%20UR%20Reply%20Manager.user.js
-// @updateURL       https://update.greasyfork.org/scripts/579002/WME%20UR%20Reply%20Manager.meta.js
 // ==/UserScript==
 
 (function () {
