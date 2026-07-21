@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name            WME UR Reply Manager
 // @name:vi         Trình quản lý phản hồi WME UR
-// @version         1.2.0-beta
+// @version         1.3.0
 // @description     Manage and quickly insert UR reply templates in WME
 // @description:vi  Quản lý và chèn nhanh các mẫu trả lời UR trong WME
 // @author          vdt2210
@@ -248,7 +248,6 @@
   };
 
   /**
-   * Effective display values: stored override per key, else script default.
    * @returns {Record<TagKey, string>}
    */
   const getUserDefaultValues = () => {
@@ -266,7 +265,6 @@
   };
 
   /**
-   * Trims inputs in place; returns only keys with non-empty values that differ from script defaults.
    * @param {NodeListOf<Element> | Element[]} inputs
    * @returns {Partial<Record<TagKey, string>>}
    */
@@ -325,20 +323,58 @@
 
   // --- UR live data & template processing ---
   let cachedURData = Object.fromEntries(TAG_KEYS.map((key) => [key, '']));
+  let wmeSDK = null;
 
-  async function getSegmentDetailByLatLon(lat, lon) {
-    if (typeof W === 'undefined' || !W.model || !W.model.segments) {
+  function getCurrentURAttributes() {
+    const panelEl = document.querySelector('.problem-edit');
+    if (!panelEl) return null;
+
+    const reactKey = Object.keys(panelEl).find(
+      (key) => key.startsWith('__reactFiber$') || key.startsWith('__reactInternalInstance$'),
+    );
+    const fiber = panelEl[reactKey];
+    const targetChild = fiber?.memoizedProps?.children?.[0];
+    const adapter = targetChild?.props?.adapter;
+
+    return adapter?.problem?.attributes || adapter?.attributes?.attributes || null;
+  }
+
+  /**
+   * @param {number} lat
+   * @param {number} lon
+   * @returns {{ pX: number, pY: number } | null}
+   */
+  function getProjectedPoint(lat, lon) {
+    try {
+      const lonlat = new OpenLayers.LonLat(lon, lat).transform(
+        new OpenLayers.Projection('EPSG:4326'),
+        W.map.getProjectionObject(),
+      );
+      return { pX: lonlat.lon, pY: lonlat.lat };
+    } catch (e) {
       return null;
     }
+  }
 
-    function getDistance(x, y, x1, y1, x2, y2) {
-      const A = x - x1,
-        B = y - y1,
+  /**
+   * @param {number} pX
+   * @param {number} pY
+   * @param {{ x: number, y: number }[]} components
+   * @returns {number}
+   */
+  function getDistanceToGeometry(pX, pY, components) {
+    let minDist = Infinity;
+    for (let i = 0; i < components.length - 1; i++) {
+      const x1 = components[i].x,
+        y1 = components[i].y;
+      const x2 = components[i + 1].x,
+        y2 = components[i + 1].y;
+      const A = pX - x1,
+        B = pY - y1,
         C = x2 - x1,
         D = y2 - y1;
-      const dot = A * C + B * D,
-        lenSq = C * C + D * D;
-      let param = lenSq !== 0 ? dot / lenSq : -1;
+      const lenSq = C * C + D * D;
+      const param = lenSq !== 0 ? (A * C + B * D) / lenSq : -1;
       let xx, yy;
       if (param < 0) {
         xx = x1;
@@ -350,103 +386,73 @@
         xx = x1 + param * C;
         yy = y1 + param * D;
       }
-      return Math.sqrt((x - xx) ** 2 + (y - yy) ** 2);
+      const dist = Math.sqrt((pX - xx) ** 2 + (pY - yy) ** 2);
+      if (dist < minDist) minDist = dist;
     }
+    return minDist;
+  }
+
+  function getDistanceToGeoJSONLine(lat, lon, coordinates) {
+    if (!Array.isArray(coordinates) || coordinates.length < 2) return Infinity;
+
+    const metersPerLonDegree = 111320 * Math.cos((lat * Math.PI) / 180);
+    const metersPerLatDegree = 110540;
+    const components = coordinates.map(([coordinateLon, coordinateLat]) => ({
+      x: coordinateLon * metersPerLonDegree,
+      y: coordinateLat * metersPerLatDegree,
+    }));
+
+    return getDistanceToGeometry(lon * metersPerLonDegree, lat * metersPerLatDegree, components);
+  }
+
+  async function getSegmentDetailByLatLon(lat, lon) {
+    if (!wmeSDK?.DataModel?.Segments) return null;
 
     for (let attempt = 0; attempt < SEGMENT_SEARCH.NUMBER_OF_RETRIES; attempt++) {
       try {
-        const segments = W.model.segments.getObjectArray();
-        debugLog(`${LOG_PREFIX} segment:`, segments);
+        const segments = wmeSDK.DataModel.Segments.getAll();
+        debugLog(`${LOG_PREFIX} SDK loaded ${segments.length} segments`);
 
-        if (!segments || segments.length === 0) {
+        if (segments.length === 0) {
           debugLog(
-            `${LOG_PREFIX} Cache empty, attempt ${attempt + 1}/${SEGMENT_SEARCH.NUMBER_OF_RETRIES}. Waiting ${SEGMENT_SEARCH.RETRY_DELAY_MS}ms...`,
+            `${LOG_PREFIX} SDK segment model empty, attempt ${attempt + 1}/${SEGMENT_SEARCH.NUMBER_OF_RETRIES}. Waiting ${SEGMENT_SEARCH.RETRY_DELAY_MS}ms...`,
           );
           await new Promise((resolve) => setTimeout(resolve, SEGMENT_SEARCH.RETRY_DELAY_MS));
           continue;
         }
 
-        const lonlat = new OpenLayers.LonLat(lon, lat).transform(
-          new OpenLayers.Projection('EPSG:4326'),
-          W.map.getProjectionObject(),
-        );
-        const pX = lonlat.lon;
-        const pY = lonlat.lat;
-        const candidates = [];
-
-        segments.forEach((seg) => {
-          const segAttrs = seg?.attributes || {};
-          const components = segAttrs.geometry?.components;
-          if (!components || components.length < 2) return;
-
-          let segmentMinDist = Infinity;
-          for (let i = 0; i < components.length - 1; i++) {
-            const dist = getDistance(
-              pX,
-              pY,
-              components[i].x,
-              components[i].y,
-              components[i + 1].x,
-              components[i + 1].y,
-            );
-            if (dist < segmentMinDist) {
-              segmentMinDist = dist;
-            }
-          }
-
-          debugLog(
-            `${LOG_PREFIX} Segment ID ${segAttrs.id}, distance to UR: ${segmentMinDist.toFixed(2)} map units (${(segmentMinDist * W.map.getResolution()).toFixed(2)} meters)`,
-          );
-
-          if (segmentMinDist <= SEGMENT_SEARCH.MAX_DIST_METERS) {
-            candidates.push({
-              segment: seg,
-              distance: segmentMinDist,
-            });
-          }
-        });
+        const candidates = segments
+          .map((segment) => ({
+            segment,
+            distanceMeters: getDistanceToGeoJSONLine(lat, lon, segment.geometry?.coordinates),
+          }))
+          .filter(({ distanceMeters }) => distanceMeters <= SEGMENT_SEARCH.MAX_DIST_METERS)
+          .sort((a, b) => a.distanceMeters - b.distanceMeters);
 
         debugLog(
           `${LOG_PREFIX} Found ${candidates.length} candidate segments within ${SEGMENT_SEARCH.MAX_DIST_METERS}m:`,
           candidates,
         );
 
-        if (candidates.length > 0) {
-          candidates.sort((a, b) => a.distance - b.distance);
-
-          const matchedSegment = candidates[0].segment;
-          const streetId = matchedSegment.attributes?.primaryStreetID;
+        const matched = candidates[0];
+        if (matched) {
+          const address = wmeSDK.DataModel.Segments.getAddress({
+            segmentId: matched.segment.id,
+          });
+          const segmentDetails = {
+            streetName: address?.street?.name || '',
+            cityName: address?.city?.name || '',
+          };
 
           debugLog(
-            `${LOG_PREFIX} Closest segment ID ${matchedSegment.id}, distance: ${candidates[0].distance.toFixed(2)} map units (${(candidates[0].distance * W.map.getResolution()).toFixed(2)} meters), streetId: ${streetId}`,
+            `${LOG_PREFIX} SDK matched segment ${matched.segment.id} at ${matched.distanceMeters.toFixed(2)} meters`,
+            segmentDetails,
           );
-
-          if (streetId) {
-            const streetModel = W.model.streets?.objects?.[streetId];
-            const streetAttrs = streetModel?.attributes || {};
-            debugLog(`${LOG_PREFIX} Street attributes for ID ${streetId}:`, streetAttrs);
-
-            const cityId = streetAttrs.cityID;
-            const cityModel = cityId ? W.model.cities?.objects?.[cityId] : null;
-            const cityAttrs = cityModel?.attributes || {};
-            debugLog(`${LOG_PREFIX} City attributes for ID ${cityId}:`, cityAttrs);
-
-            const segmentDetails = {
-              streetName: streetAttrs.name || '',
-              cityName: cityAttrs.name || '',
-            };
-
-            debugLog(
-              `${LOG_PREFIX} Segment founded at attempt ${attempt + 1}/${SEGMENT_SEARCH.NUMBER_OF_RETRIES}`,
-              segmentDetails,
-            );
-
-            return segmentDetails;
-          }
+          return segmentDetails;
         }
       } catch (err) {
         console.warn(
-          `${LOG_PREFIX} Error on attempt ${attempt + 1}/${SEGMENT_SEARCH.NUMBER_OF_RETRIES}:`,
+          `${LOG_PREFIX} SDK segment lookup error on attempt ${attempt + 1}/${SEGMENT_SEARCH.NUMBER_OF_RETRIES}:`,
           err.message,
         );
       }
@@ -458,12 +464,114 @@
     }
 
     debugLog(
-      `${LOG_PREFIX} Timeout reached. No segment found within ${SEGMENT_SEARCH.MAX_DIST_METERS}m.`,
+      `${LOG_PREFIX} SDK lookup finished without a segment within ${SEGMENT_SEARCH.MAX_DIST_METERS}m.`,
     );
     return null;
   }
 
-  async function fetchCurrentURData() {
+  function waitForMapDataLoaded(timeoutMs = 5000) {
+    if (!wmeSDK?.Events?.once) {
+      return new Promise((resolve) => setTimeout(resolve, SEGMENT_SEARCH.RETRY_DELAY_MS));
+    }
+
+    return Promise.race([
+      wmeSDK.Events.once({ eventName: 'wme-map-data-loaded' }),
+      new Promise((resolve) => setTimeout(resolve, timeoutMs)),
+    ]);
+  }
+
+  async function getSegmentDetailByLoadingURArea(lat, lon) {
+    if (!wmeSDK?.Map) return null;
+
+    const originalCenter = wmeSDK.Map.getMapCenter();
+    const originalZoom = wmeSDK.Map.getZoomLevel();
+    const detailZoom = Math.max(originalZoom, 18);
+    const [left, bottom, right, top] = wmeSDK.Map.getMapExtent();
+    const urIsVisible = lon >= left && lon <= right && lat >= bottom && lat <= top;
+    const mapNeedsToMove = originalZoom < 18 || !urIsVisible;
+
+    if (!mapNeedsToMove) {
+      debugLog(`${LOG_PREFIX} UR is already visible at detail zoom; skipping map reload wait.`);
+      return getSegmentDetailByLatLon(lat, lon);
+    }
+
+    debugLog(`${LOG_PREFIX} Loading map data around UR at zoom ${detailZoom}...`);
+    const dataLoaded = waitForMapDataLoaded();
+    wmeSDK.Map.setMapCenter({ lonLat: { lat, lon }, zoomLevel: detailZoom });
+
+    try {
+      await dataLoaded;
+      return await getSegmentDetailByLatLon(lat, lon);
+    } finally {
+      debugLog(`${LOG_PREFIX} Restoring previous map center and zoom...`);
+      wmeSDK.Map.setMapCenter({ lonLat: originalCenter, zoomLevel: originalZoom });
+    }
+  }
+
+  /**
+   * @param {number} lat
+   * @param {number} lon
+   * @returns {string}
+   */
+  function getCityNameByLatLon(lat, lon) {
+    if (typeof W === 'undefined' || !W.model?.cities) return '';
+
+    const projected = getProjectedPoint(lat, lon);
+    if (!projected) return '';
+    const { pX, pY } = projected;
+
+    let closestCityName = '';
+    let minDist = Infinity;
+
+    try {
+      const cities = W.model.cities.getObjectArray();
+      debugLog(`${LOG_PREFIX} City fallback: scanning ${cities.length} cities...`);
+
+      cities.forEach((city) => {
+        const cityName = (city.attributes?.name || '').trim();
+        if (!cityName) return; // bỏ qua No City
+
+        const geom = city.geometry || city.attributes?.geometry;
+        if (!geom) return;
+
+        let cx, cy;
+        if (typeof geom.x === 'number' && typeof geom.y === 'number') {
+          cx = geom.x;
+          cy = geom.y;
+        } else if (typeof geom.getBounds === 'function') {
+          const bounds = geom.getBounds();
+          if (bounds) {
+            cx = (bounds.left + bounds.right) / 2;
+            cy = (bounds.bottom + bounds.top) / 2;
+          }
+        }
+
+        if (cx == null || cy == null) return;
+
+        const dist = Math.sqrt((pX - cx) ** 2 + (pY - cy) ** 2);
+        debugLog(`${LOG_PREFIX} City "${cityName}" dist: ${dist.toFixed(2)} map units`);
+
+        if (dist < minDist) {
+          minDist = dist;
+          closestCityName = cityName;
+        }
+      });
+
+      if (closestCityName) {
+        const distMeters = minDist * (W.map?.getResolution?.() ?? 1);
+
+        debugLog(
+          `${LOG_PREFIX} City fallback found: "${closestCityName}" at ${distMeters.toFixed(0)}m`,
+        );
+      }
+    } catch (err) {
+      console.warn(`${LOG_PREFIX} getCityNameByLatLon error:`, err.message);
+    }
+
+    return closestCityName;
+  }
+
+  async function fetchCurrentURData(attrs = getCurrentURAttributes()) {
     let cityName = '';
     let lat = null;
     let lon = null;
@@ -472,61 +580,54 @@
     let streetName = '';
 
     try {
-      const panelEl = document.querySelector('.problem-edit');
-      if (panelEl) {
-        const reactKey = Object.keys(panelEl).find(
-          (key) => key.startsWith('__reactFiber$') || key.startsWith('__reactInternalInstance$'),
-        );
-        const fiber = panelEl[reactKey];
-        debugLog(`${LOG_PREFIX} React fiber found:`, fiber);
-
-        const targetChild = fiber?.memoizedProps?.children?.[0];
-        debugLog(`${LOG_PREFIX} Target child:`, targetChild);
-        const adapter = targetChild?.props?.adapter;
-        debugLog(`${LOG_PREFIX} Adapter found:`, adapter);
-        const attrs = adapter?.problem?.attributes || adapter?.attributes?.attributes;
+      if (attrs) {
         debugLog(`${LOG_PREFIX} Attributes found:`, attrs);
+        if (attrs.createdBy) {
+          const userId = attrs.createdBy;
+          debugLog(`${LOG_PREFIX} Reporter user ID:`, userId);
 
-        if (attrs) {
-          if (attrs.createdBy) {
-            const userId = attrs.createdBy;
-            debugLog(`${LOG_PREFIX} Reporter user ID:`, userId);
-
-            if (typeof W !== 'undefined' && W.model && W.model.users) {
-              debugLog(`${LOG_PREFIX} W.model.users:`, W.model.users);
-              const userModelAttrs = W.model.users?.objects?.[Number(userId)]?.attributes;
-              debugLog(`${LOG_PREFIX} Reporter user attributes:`, userModelAttrs);
-              if (userModelAttrs && userModelAttrs.userName) {
-                reporter = userModelAttrs.userName.trim();
-                debugLog(`${LOG_PREFIX} Reporter name:`, reporter);
-              }
+          if (typeof W !== 'undefined' && W.model && W.model.users) {
+            debugLog(`${LOG_PREFIX} W.model.users:`, W.model.users);
+            const userModelAttrs = W.model.users?.objects?.[Number(userId)]?.attributes;
+            debugLog(`${LOG_PREFIX} Reporter user attributes:`, userModelAttrs);
+            if (userModelAttrs && userModelAttrs.userName) {
+              reporter = userModelAttrs.userName.trim();
+              debugLog(`${LOG_PREFIX} Reporter name:`, reporter);
             }
           }
+        }
 
-          if (attrs.cityName) {
-            cityName = String(attrs.cityName).trim();
-            debugLog(`${LOG_PREFIX} City name from attributes:`, cityName);
-          }
+        if (attrs.cityName) {
+          cityName = String(attrs.cityName).trim();
+          debugLog(`${LOG_PREFIX} City name from attributes:`, cityName);
+        }
 
-          if (attrs.geoJSONGeometry && Array.isArray(attrs.geoJSONGeometry.coordinates)) {
-            const parseLon = parseFloat(attrs.geoJSONGeometry.coordinates[0]);
-            const parseLat = parseFloat(attrs.geoJSONGeometry.coordinates[1]);
+        if (attrs.geoJSONGeometry && Array.isArray(attrs.geoJSONGeometry.coordinates)) {
+          const parseLon = parseFloat(attrs.geoJSONGeometry.coordinates[0]);
+          const parseLat = parseFloat(attrs.geoJSONGeometry.coordinates[1]);
 
-            if (!isNaN(parseLat) && !isNaN(parseLon)) {
-              lon = parseLon;
-              lat = parseLat;
-              coords = `${lat}, ${lon}`;
-              debugLog(`${LOG_PREFIX} Coordinates from attributes:`, { lat, lon });
+          if (!isNaN(parseLat) && !isNaN(parseLon)) {
+            lon = parseLon;
+            lat = parseLat;
+            coords = `${lat}, ${lon}`;
+            debugLog(`${LOG_PREFIX} Coordinates from attributes:`, { lat, lon });
 
-              const segmentDetail = await getSegmentDetailByLatLon(lat, lon);
-              if (segmentDetail) {
-                streetName = segmentDetail.streetName.trim();
-                debugLog(`${LOG_PREFIX} Street name from segment detail:`, streetName);
+            const segmentDetail = await getSegmentDetailByLoadingURArea(lat, lon);
+            if (segmentDetail) {
+              streetName = segmentDetail.streetName.trim();
+              debugLog(`${LOG_PREFIX} Street name from segment detail:`, streetName);
 
-                if (!cityName && segmentDetail.cityName) {
-                  cityName = segmentDetail.cityName.trim();
-                  debugLog(`${LOG_PREFIX} City name from segment detail:`, cityName);
-                }
+              if (!cityName && segmentDetail.cityName) {
+                cityName = segmentDetail.cityName.trim();
+                debugLog(`${LOG_PREFIX} City name from segment detail:`, cityName);
+              }
+            }
+
+            if (!cityName) {
+              debugLog(`${LOG_PREFIX} No city from segments, trying city centroid fallback...`);
+              cityName = getCityNameByLatLon(lat, lon);
+              if (cityName) {
+                debugLog(`${LOG_PREFIX} City name from city centroid fallback:`, cityName);
               }
             }
           }
@@ -536,7 +637,7 @@
       console.warn(`${LOG_PREFIX} Error extracting data:`, err.message);
     }
 
-    cachedURData = {
+    return {
       [TagKey.CITY]: cityName,
       [TagKey.LAT]: lat,
       [TagKey.LON]: lon,
@@ -544,6 +645,17 @@
       [TagKey.REPORTER]: reporter,
       [TagKey.STREET]: streetName,
     };
+  }
+
+  function setTriggerLoading(btn, isLoading) {
+    if (!btn) return;
+    if (isLoading) {
+      btn.setAttribute('busy', '');
+      btn.setAttribute('disabled', '');
+    } else {
+      btn.removeAttribute('busy');
+      btn.removeAttribute('disabled');
+    }
   }
 
   function processTemplateContent(content) {
@@ -756,12 +868,18 @@
       btn.style.cssText = 'width: 100%; margin-bottom: 6px;';
       btn.onclick = async (e) => {
         e.preventDefault();
-        btn.setAttribute('busy', '');
-        btn.setAttribute('disabled', '');
-        await fetchCurrentURData();
-        openModal(wzTA);
-        btn.removeAttribute('busy');
-        btn.removeAttribute('disabled');
+        setTriggerLoading(btn, true);
+        cachedURData = Object.fromEntries(TAG_KEYS.map((key) => [key, '']));
+
+        try {
+          cachedURData = await fetchCurrentURData();
+          debugLog(`${LOG_PREFIX} Current UR data loaded:`, cachedURData);
+          openModal(wzTA);
+        } catch (err) {
+          console.warn(`${LOG_PREFIX} Failed to load current UR data:`, err);
+        } finally {
+          setTriggerLoading(btn, false);
+        }
       };
       form.insertBefore(btn, wzTA);
     });
@@ -1280,6 +1398,19 @@
     }
 
     initializeStorage();
+    if (!wmeSDK && typeof getWmeSdk === 'function') {
+      try {
+        wmeSDK = getWmeSdk({
+          scriptId: 'wme-ur-reply-manager',
+          scriptName: 'WME UR Reply Manager',
+        });
+      } catch (err) {
+        console.warn(
+          `${LOG_PREFIX} WME SDK initialization failed; segment lookup unavailable:`,
+          err,
+        );
+      }
+    }
     initSidebar();
     injectTrigger();
 
