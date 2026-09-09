@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name            WME UR Reply Manager
 // @name:vi         Trình quản lý phản hồi WME UR
-// @version         1.4.0
+// @version         1.4.1
 // @description     Manage and quickly insert UR reply templates in WME
 // @description:vi  Quản lý và chèn nhanh các mẫu trả lời UR trong WME
 // @author          vdt2210
@@ -69,6 +69,7 @@
       tagLon: 'Longitude',
       tagCoords: 'GPS coordinates (latitude, longitude)',
       tagReporter: 'Name of the person who reported this UR',
+      tagDescription: 'Report description',
       tagsHeading: 'Available Tags',
       tagsHint:
         "Tags: Prioritizes Actual data ➜ Personal settings ➜ Default. Tip to force custom value: use {tag | 'default'} (e.g., {reporter | 'Reporter'}).",
@@ -114,6 +115,7 @@
       tagLon: 'Kinh độ',
       tagCoords: 'Tọa độ GPS (vĩ độ, kinh độ)',
       tagReporter: 'Tên người báo cáo UR',
+      tagDescription: 'Nội dung báo cáo',
       tagsHeading: 'Các thẻ sẵn có',
       tagsHint:
         "Thẻ: Ưu tiên điền Dữ liệu thực tế ➜ Cấu hình cá nhân ➜ Mặc định. Mẹo ép giá trị riêng: dùng {tag | 'mặc định'} (Ví dụ: {reporter | 'Người báo cáo'}).",
@@ -135,6 +137,7 @@
     COORDS: 'coords',
     REPORTER: 'reporter',
     STREET: 'street',
+    DESCRIPTION: 'description',
   });
 
   const TAG_KEYS = Object.values(TagKey);
@@ -147,7 +150,10 @@
     [TagKey.COORDS]: 'tagCoords',
     [TagKey.REPORTER]: 'tagReporter',
     [TagKey.STREET]: 'tagStreet',
+    [TagKey.DESCRIPTION]: 'tagDescription',
   };
+
+  const NO_DEFAULT_VALUE_TAG_KEYS = [TagKey.COORDS, TagKey.LAT, TagKey.LON, TagKey.DESCRIPTION];
 
   function debugLog(...args) {
     if (DEBUG) {
@@ -811,6 +817,7 @@
     let coords = '';
     let reporter = '';
     let streetName = '';
+    let description = '';
 
     try {
       if (attrs) {
@@ -865,6 +872,19 @@
             }
           }
         }
+
+        if (attrs.description) {
+          description = String(attrs.description).trim();
+          debugLog(`${LOG_PREFIX} Description from attributes:`, description);
+
+          if (!reporter) {
+            const usernameInDescription = description.match(/(?:waze\s+)?username:?\s*(\w+)/i)?.[1];
+            if (usernameInDescription) {
+              reporter = usernameInDescription;
+              debugLog(`${LOG_PREFIX} Reporter name from description:`, reporter);
+            }
+          }
+        }
       }
     } catch (err) {
       console.warn(`${LOG_PREFIX} Error extracting data:`, err.message);
@@ -877,6 +897,7 @@
       [TagKey.COORDS]: coords,
       [TagKey.REPORTER]: reporter,
       [TagKey.STREET]: streetName,
+      [TagKey.DESCRIPTION]: description,
     };
   }
 
@@ -1514,7 +1535,7 @@
 
       itemDiv.appendChild(tagDisplayDiv);
 
-      if (![TagKey.COORDS, TagKey.LAT, TagKey.LON].includes(tagKey)) {
+      if (!NO_DEFAULT_VALUE_TAG_KEYS.includes(tagKey)) {
         const inputDiv = document.createElement('div');
         inputDiv.style.cssText = 'display: flex; gap: 6px; align-items: center;';
 
