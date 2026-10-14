@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name            WME UR Reply Manager
 // @name:vi         Trình quản lý phản hồi WME UR
-// @version         1.4.1
+// @version         1.4.2
 // @description     Manage and quickly insert UR reply templates in WME
 // @description:vi  Quản lý và chèn nhanh các mẫu trả lời UR trong WME
 // @author          vdt2210
@@ -1129,6 +1129,8 @@
 
     const header = document.createElement('div');
     header.className = 'modal-header';
+    header.style.borderTopLeftRadius = 'inherit';
+    header.style.borderTopRightRadius = 'inherit';
     const titleEl = document.createElement('h5');
     titleEl.className = 'modal-title';
     titleEl.textContent = title;
@@ -1144,6 +1146,8 @@
 
     const footer = document.createElement('div');
     footer.className = 'modal-footer';
+    footer.style.borderBottomLeftRadius = 'inherit';
+    footer.style.borderBottomRightRadius = 'inherit';
     const builtFooter = footerBuilder(closeModal);
     if (builtFooter) {
       footer.appendChild(builtFooter);
@@ -1341,7 +1345,8 @@
 
       const layout = document.createElement('div');
       layout.className = 'list-item-card-layout';
-      layout.style.gridTemplateColumns = 'inherit';
+      layout.style.gridTemplateColumns = 'inherit !important';
+      layout.style.gridAutoColumns = 'min-content !important';
 
       const info = document.createElement('div');
       info.className = 'list-item-card-info';
