@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name            WME UR Reply Manager
 // @name:vi         Trình quản lý phản hồi WME UR
-// @version         1.4.2
+// @version         1.4.3
 // @description     Manage and quickly insert UR reply templates in WME
 // @description:vi  Quản lý và chèn nhanh các mẫu trả lời UR trong WME
 // @author          vdt2210
@@ -1345,8 +1345,8 @@
 
       const layout = document.createElement('div');
       layout.className = 'list-item-card-layout';
-      layout.style.gridTemplateColumns = 'inherit !important';
-      layout.style.gridAutoColumns = 'min-content !important';
+      layout.style.setProperty('grid-template-columns', 'inherit', 'important');
+      layout.style.setProperty('grid-auto-columns', 'inherit', 'important');
 
       const info = document.createElement('div');
       info.className = 'list-item-card-info';
